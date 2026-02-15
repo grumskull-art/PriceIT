@@ -1,0 +1,433 @@
+<!doctype html>
+<html lang="da">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>PriceIT - iPhone Web App</title>
+  <style>
+    :root {
+      --bg-1: #f5f0e6;
+      --bg-2: #d7e6e0;
+      --card: #fffdf8;
+      --ink: #1e2430;
+      --muted: #4a5564;
+      --line: #d6d9df;
+      --accent: #1f7a67;
+      --bad: #b53e3e;
+      --good: #1f7a67;
+      --warn: #8a6a1f;
+      --shadow: 0 14px 36px rgba(30, 36, 48, 0.12);
+      --radius: 16px;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      font-family: "Avenir Next", "Trebuchet MS", "Gill Sans", sans-serif;
+      background:
+        radial-gradient(1000px 500px at 100% -10%, #f3d7c5 10%, transparent 60%),
+        radial-gradient(900px 500px at -20% 120%, #dce8f7 5%, transparent 55%),
+        linear-gradient(140deg, var(--bg-1), var(--bg-2));
+      padding: 18px 14px 24px;
+    }
+
+    .wrap {
+      max-width: 760px;
+      margin: 0 auto;
+    }
+
+    .title {
+      margin: 4px 0 2px;
+      font-family: "Baskerville", "Palatino Linotype", serif;
+      letter-spacing: 0.4px;
+      font-size: 34px;
+      line-height: 1.1;
+    }
+
+    .subtitle {
+      margin: 0 0 14px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 14px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 10px;
+    }
+
+    @media (min-width: 700px) {
+      .grid-2 {
+        grid-template-columns: 1fr 1fr;
+      }
+    }
+
+    label {
+      display: block;
+      font-size: 12px;
+      color: var(--muted);
+      margin: 0 0 5px;
+      font-weight: 600;
+    }
+
+    input {
+      width: 100%;
+      border-radius: 12px;
+      border: 1px solid #c6ccd6;
+      padding: 12px;
+      font-size: 16px;
+      color: var(--ink);
+      background: #fff;
+    }
+
+    input:focus {
+      outline: 2px solid #91d4c6;
+      border-color: #8bbcae;
+    }
+
+    .btn-row {
+      display: flex;
+      gap: 10px;
+      margin-top: 10px;
+    }
+
+    button {
+      border: 0;
+      border-radius: 12px;
+      padding: 12px 14px;
+      font-size: 15px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .btn-main {
+      flex: 1;
+      background: linear-gradient(135deg, #1f7a67, #205f95);
+      color: #fff;
+    }
+
+    .btn-light {
+      background: #ebeff5;
+      color: #223043;
+    }
+
+    .meta {
+      margin-top: 12px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .status {
+      margin-top: 10px;
+      font-size: 14px;
+      min-height: 20px;
+    }
+
+    .result {
+      margin-top: 12px;
+      display: none;
+      animation: rise .22s ease-out;
+    }
+
+    @keyframes rise {
+      from { opacity: 0; transform: translateY(6px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .pill {
+      display: inline-block;
+      border-radius: 999px;
+      padding: 6px 10px;
+      font-weight: 800;
+      letter-spacing: .2px;
+      font-size: 12px;
+      margin-bottom: 8px;
+    }
+
+    .pill.good { background: #dcf2ec; color: var(--good); }
+    .pill.bad { background: #f8e0e0; color: var(--bad); }
+    .pill.warn { background: #f8efd4; color: var(--warn); }
+
+    .metrics {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: 1fr 1fr;
+      margin: 8px 0 12px;
+    }
+
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 10px;
+      background: #fff;
+    }
+
+    .metric .k {
+      font-size: 11px;
+      color: var(--muted);
+      display: block;
+      margin-bottom: 2px;
+    }
+
+    .metric .v {
+      font-weight: 800;
+      font-size: 16px;
+    }
+
+    .alt {
+      border-top: 1px dashed var(--line);
+      padding-top: 8px;
+      margin-top: 8px;
+    }
+
+    .alt a {
+      color: #205f95;
+      text-decoration: none;
+      font-weight: 700;
+    }
+
+    .hint {
+      margin-top: 10px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1 class="title">PriceIT</h1>
+    <p class="subtitle">iPhone-webapp til hurtig prischeck. Kildefilter: kun DK + amazon.de. eBay er blokeret.</p>
+
+    <form id="form" class="card">
+      <div class="grid">
+        <div>
+          <label for="productUrl">Produktlink (hurtig autofyld)</label>
+          <input id="productUrl" name="product_url" type="url" placeholder="Indsæt link fra produktsiden">
+        </div>
+      </div>
+
+      <div class="btn-row" style="margin-top:8px;">
+        <button class="btn-light" id="extractBtn" type="button">Hent data fra link</button>
+        <button class="btn-light" id="pasteBtn" type="button">Indsæt link</button>
+      </div>
+
+      <div class="grid" style="margin-top:10px;">
+        <div>
+          <label for="productName">Produktnavn (anbefalet)</label>
+          <input id="productName" name="product_name" type="text" placeholder="fx Nike Air Zoom Pegasus 40">
+        </div>
+      </div>
+
+      <div class="grid grid-2" style="margin-top:10px;">
+        <div>
+          <label for="currentPrice">Pris på siden</label>
+          <input id="currentPrice" name="current_price" type="text" placeholder="fx 999,00 DKK">
+        </div>
+        <div>
+          <label for="brand">Brand/model</label>
+          <input id="brand" name="brand" type="text" placeholder="fx Reima eller Pikavari">
+        </div>
+        <div>
+          <label for="gtin13">GTIN13 (valgfri)</label>
+          <input id="gtin13" name="gtin13" type="text" inputmode="numeric" placeholder="13 cifre">
+        </div>
+        <div>
+          <label for="sku">SKU (valgfri)</label>
+          <input id="sku" name="sku" type="text" placeholder="fx ABC-123">
+        </div>
+      </div>
+
+      <div class="btn-row">
+        <button class="btn-main" type="submit">Analyser Pris</button>
+        <button class="btn-light" id="clearBtn" type="button">Ryd</button>
+      </div>
+
+      <div class="meta">Marked er låst til Danmark (DKK). Markedspris beregnes som total (vare + fragt når fragtdata findes).</div>
+      <div id="status" class="status"></div>
+    </form>
+
+    <section id="result" class="card result"></section>
+  </div>
+
+  <script>
+    const form = document.getElementById("form");
+    const statusEl = document.getElementById("status");
+    const resultEl = document.getElementById("result");
+    const clearBtn = document.getElementById("clearBtn");
+    const extractBtn = document.getElementById("extractBtn");
+    const pasteBtn = document.getElementById("pasteBtn");
+    const productUrlInput = document.getElementById("productUrl");
+    const productNameInput = document.getElementById("productName");
+    const currentPriceInput = document.getElementById("currentPrice");
+    const brandInput = document.getElementById("brand");
+    const gtin13Input = document.getElementById("gtin13");
+    const skuInput = document.getElementById("sku");
+
+    const fmt = (value, currency) => {
+      if (value === null || value === undefined) return "-";
+      return new Intl.NumberFormat("da-DK", { style: "currency", currency: currency || "DKK" }).format(value);
+    };
+
+    const verdictClass = (verdict) => {
+      if (verdict === "GREAT_DEAL") return "good";
+      if (verdict === "OVERPRICED") return "bad";
+      return "warn";
+    };
+
+    const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      "\"": "&quot;",
+      "'": "&#39;"
+    }[c]));
+
+    clearBtn.addEventListener("click", () => {
+      form.reset();
+      resultEl.style.display = "none";
+      resultEl.innerHTML = "";
+      statusEl.textContent = "";
+    });
+
+    pasteBtn.addEventListener("click", async () => {
+      if (!navigator.clipboard?.readText) {
+        statusEl.textContent = "Clipboard er ikke tilgængelig i denne browser.";
+        return;
+      }
+      try {
+        const text = (await navigator.clipboard.readText()).trim();
+        if (!text) {
+          statusEl.textContent = "Clipboard er tom.";
+          return;
+        }
+        productUrlInput.value = text;
+        statusEl.textContent = "Link indsat. Tryk 'Hent data fra link'.";
+      } catch {
+        statusEl.textContent = "Kunne ikke læse clipboard. Indsæt link manuelt.";
+      }
+    });
+
+    extractBtn.addEventListener("click", async () => {
+      const url = productUrlInput.value.trim();
+      if (!url) {
+        statusEl.textContent = "Indsæt et produktlink først.";
+        return;
+      }
+
+      statusEl.textContent = "Henter produktdata fra link...";
+      try {
+        const response = await fetch("/v1/extract-web", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url })
+        });
+        const text = await response.text();
+        let data;
+        try {
+          data = JSON.parse(text);
+        } catch {
+          throw new Error(text || "Ugyldigt svar fra extract endpoint.");
+        }
+        if (!response.ok) {
+          throw new Error(data.detail || ("HTTP " + response.status));
+        }
+
+        productNameInput.value = data.product_name || "";
+        currentPriceInput.value = data.current_price || "";
+        brandInput.value = data.brand || "";
+        gtin13Input.value = data.gtin13 || "";
+        skuInput.value = data.sku || "";
+
+        statusEl.textContent = "Data hentet. Tjek felterne og tryk 'Analyser Pris'.";
+      } catch (err) {
+        statusEl.textContent = "Fejl ved link-hentning: " + (err?.message || "Ukendt fejl");
+      }
+    });
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      statusEl.textContent = "";
+      resultEl.style.display = "none";
+
+      const data = new FormData(form);
+      const payload = {
+        product_name: (data.get("product_name") || "").toString().trim() || null,
+        current_price: (data.get("current_price") || "").toString().trim() || null,
+        brand: (data.get("brand") || "").toString().trim() || null,
+        gtin13: (data.get("gtin13") || "").toString().trim() || null,
+        sku: (data.get("sku") || "").toString().trim() || null
+      };
+      if (!payload.product_name && !payload.gtin13 && !payload.sku) {
+        statusEl.textContent = "Indsæt mindst produktnavn, GTIN13 eller SKU.";
+        return;
+      }
+
+      statusEl.textContent = "Analyserer...";
+
+      try {
+        const response = await fetch("/v1/analyze-web", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify(payload)
+        });
+
+        const bodyText = await response.text();
+        let json;
+        try {
+          json = JSON.parse(bodyText);
+        } catch {
+          throw new Error(bodyText || "Ugyldigt API-svar.");
+        }
+
+        if (!response.ok) {
+          throw new Error(json.detail || ("HTTP " + response.status));
+        }
+
+        renderResult(json);
+        statusEl.textContent = "Klar.";
+      } catch (err) {
+        statusEl.textContent = "Fejl: " + (err?.message || "Ukendt fejl");
+      }
+    });
+
+    function renderResult(data) {
+      const alternatives = (data.top_3_alternatives || []).map((alt) => `
+        <div class="alt">
+          <div class="hint">Fundet titel: ${esc(alt.title || "-")}</div>
+          <div><strong>${esc(alt.shop)}</strong> - ${fmt(alt.price, alt.currency || data.currency)}</div>
+          <div class="hint">Vare: ${fmt(alt.item_price, alt.currency || data.currency)} | Fragt: ${fmt(alt.shipping_price, alt.currency || data.currency)}</div>
+          <div><a href="${esc(alt.url)}" target="_blank" rel="noopener noreferrer">Open tilbud</a></div>
+        </div>
+      `).join("");
+
+      resultEl.innerHTML = `
+        <div class="pill ${verdictClass(data.verdict)}">${esc(data.verdict)}</div>
+        <div class="metrics">
+          <div class="metric"><span class="k">Aktuel Pris</span><span class="v">${fmt(data.current_page_price, data.currency)}</span></div>
+          <div class="metric"><span class="k">Laveste Markedspris</span><span class="v">${fmt(data.market_min_price, data.currency)}</span></div>
+          <div class="metric"><span class="k">Markeds-gennemsnit</span><span class="v">${fmt(data.market_avg_price, data.currency)}</span></div>
+          <div class="metric"><span class="k">Forskel mod laveste</span><span class="v">${fmt(data.savings_vs_min, data.currency)}</span></div>
+        </div>
+        <div><strong>Query type:</strong> ${esc(data.query_type)}</div>
+        <div><strong>Filtrerede resultater:</strong> ${esc(data.excluded_results)}</div>
+        <div class="hint">Top alternativer</div>
+        ${alternatives || "<div class=\"alt\">Ingen alternativer fundet.</div>"}
+      `;
+
+      resultEl.style.display = "block";
+    }
+  </script>
+</body>
+</html>
