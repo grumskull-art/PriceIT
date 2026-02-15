@@ -206,7 +206,7 @@
 <body>
   <div class="wrap">
     <h1 class="title">PriceIT</h1>
-    <p class="subtitle">iPhone-webapp til hurtig prischeck. Kildefilter: kun DK + amazon.de. eBay er blokeret.</p>
+    <p class="subtitle">iPhone-webapp til prischeck + søgning. Kildefilter: kun DK + amazon.de. eBay er blokeret.</p>
 
     <form id="form" class="card">
       <div class="grid">
@@ -249,6 +249,7 @@
 
       <div class="btn-row">
         <button class="btn-main" type="submit">Analyser Pris</button>
+        <button class="btn-light" id="searchBtn" type="button">Søg Produkt</button>
         <button class="btn-light" id="clearBtn" type="button">Ryd</button>
       </div>
 
@@ -264,6 +265,7 @@
     const statusEl = document.getElementById("status");
     const resultEl = document.getElementById("result");
     const clearBtn = document.getElementById("clearBtn");
+    const searchBtn = document.getElementById("searchBtn");
     const extractBtn = document.getElementById("extractBtn");
     const pasteBtn = document.getElementById("pasteBtn");
     const productUrlInput = document.getElementById("productUrl");
@@ -292,10 +294,44 @@
       "'": "&#39;"
     }[c]));
 
-    clearBtn.addEventListener("click", () => {
-      form.reset();
+    function hideResult() {
       resultEl.style.display = "none";
       resultEl.innerHTML = "";
+    }
+
+    function buildPayload() {
+      const data = new FormData(form);
+      return {
+        product_name: (data.get("product_name") || "").toString().trim() || null,
+        current_price: (data.get("current_price") || "").toString().trim() || null,
+        brand: (data.get("brand") || "").toString().trim() || null,
+        gtin13: (data.get("gtin13") || "").toString().trim() || null,
+        sku: (data.get("sku") || "").toString().trim() || null
+      };
+    }
+
+    async function callJson(endpoint, payload) {
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const bodyText = await response.text();
+      let json;
+      try {
+        json = JSON.parse(bodyText);
+      } catch {
+        throw new Error(bodyText || "Ugyldigt API-svar.");
+      }
+      if (!response.ok) {
+        throw new Error(json.detail || ("HTTP " + response.status));
+      }
+      return json;
+    }
+
+    clearBtn.addEventListener("click", () => {
+      form.reset();
+      hideResult();
       statusEl.textContent = "";
     });
 
@@ -326,29 +362,13 @@
 
       statusEl.textContent = "Henter produktdata fra link...";
       try {
-        const response = await fetch("/v1/extract-web", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ url })
-        });
-        const text = await response.text();
-        let data;
-        try {
-          data = JSON.parse(text);
-        } catch {
-          throw new Error(text || "Ugyldigt svar fra extract endpoint.");
-        }
-        if (!response.ok) {
-          throw new Error(data.detail || ("HTTP " + response.status));
-        }
-
+        const data = await callJson("/v1/extract-web", { url });
         productNameInput.value = data.product_name || "";
         currentPriceInput.value = data.current_price || "";
         brandInput.value = data.brand || "";
         gtin13Input.value = data.gtin13 || "";
         skuInput.value = data.sku || "";
-
-        statusEl.textContent = "Data hentet. Tjek felterne og tryk 'Analyser Pris'.";
+        statusEl.textContent = "Data hentet. Tjek felterne og tryk 'Analyser Pris' eller 'Søg Produkt'.";
       } catch (err) {
         statusEl.textContent = "Fejl ved link-hentning: " + (err?.message || "Ukendt fejl");
       }
@@ -356,53 +376,44 @@
 
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
-      statusEl.textContent = "";
-      resultEl.style.display = "none";
+      const payload = buildPayload();
+      hideResult();
 
-      const data = new FormData(form);
-      const payload = {
-        product_name: (data.get("product_name") || "").toString().trim() || null,
-        current_price: (data.get("current_price") || "").toString().trim() || null,
-        brand: (data.get("brand") || "").toString().trim() || null,
-        gtin13: (data.get("gtin13") || "").toString().trim() || null,
-        sku: (data.get("sku") || "").toString().trim() || null
-      };
       if (!payload.product_name && !payload.gtin13 && !payload.sku) {
         statusEl.textContent = "Indsæt mindst produktnavn, GTIN13 eller SKU.";
         return;
       }
 
       statusEl.textContent = "Analyserer...";
-
       try {
-        const response = await fetch("/v1/analyze-web", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify(payload)
-        });
-
-        const bodyText = await response.text();
-        let json;
-        try {
-          json = JSON.parse(bodyText);
-        } catch {
-          throw new Error(bodyText || "Ugyldigt API-svar.");
-        }
-
-        if (!response.ok) {
-          throw new Error(json.detail || ("HTTP " + response.status));
-        }
-
-        renderResult(json);
+        const json = await callJson("/v1/analyze-web", payload);
+        renderAnalyzeResult(json);
         statusEl.textContent = "Klar.";
       } catch (err) {
         statusEl.textContent = "Fejl: " + (err?.message || "Ukendt fejl");
       }
     });
 
-    function renderResult(data) {
+    searchBtn.addEventListener("click", async () => {
+      const payload = buildPayload();
+      hideResult();
+
+      if (!payload.product_name && !payload.gtin13 && !payload.sku) {
+        statusEl.textContent = "Indsæt mindst produktnavn, GTIN13 eller SKU.";
+        return;
+      }
+
+      statusEl.textContent = "Søger efter tilbud...";
+      try {
+        const json = await callJson("/v1/search-web", { ...payload, limit: 20 });
+        renderSearchResult(json);
+        statusEl.textContent = "Klar.";
+      } catch (err) {
+        statusEl.textContent = "Fejl: " + (err?.message || "Ukendt fejl");
+      }
+    });
+
+    function renderAnalyzeResult(data) {
       const alternatives = (data.top_3_alternatives || []).map((alt) => `
         <div class="alt">
           <div class="hint">Fundet titel: ${esc(alt.title || "-")}</div>
@@ -425,7 +436,27 @@
         <div class="hint">Top alternativer</div>
         ${alternatives || "<div class=\"alt\">Ingen alternativer fundet.</div>"}
       `;
+      resultEl.style.display = "block";
+    }
 
+    function renderSearchResult(data) {
+      const offers = (data.offers || []).map((alt, index) => `
+        <div class="alt">
+          <div><strong>${index + 1}. ${esc(alt.shop)}</strong> - ${fmt(alt.price, alt.currency || data.currency)}</div>
+          <div class="hint">Vare: ${fmt(alt.item_price, alt.currency || data.currency)} | Fragt: ${fmt(alt.shipping_price, alt.currency || data.currency)}</div>
+          <div class="hint">Fundet titel: ${esc(alt.title || "-")}</div>
+          <div><a href="${esc(alt.url)}" target="_blank" rel="noopener noreferrer">Open tilbud</a></div>
+        </div>
+      `).join("");
+
+      resultEl.innerHTML = `
+        <div class="pill warn">SEARCH_MODE</div>
+        <div><strong>Query type:</strong> ${esc(data.query_type)}</div>
+        <div><strong>Match:</strong> ${esc(data.total_matches)}</div>
+        <div><strong>Filtrerede resultater:</strong> ${esc(data.excluded_results)}</div>
+        <div class="hint">Top tilbud (total inkl. fragt)</div>
+        ${offers || "<div class=\"alt\">Ingen tilbud fundet.</div>"}
+      `;
       resultEl.style.display = "block";
     }
   </script>

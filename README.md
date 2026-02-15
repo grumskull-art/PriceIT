@@ -20,6 +20,7 @@ uvicorn main:app --reload --port 8000
 - Open browser URL: `/app` (same host as API).
 - Root `/` redirects to `/app`.
 - Web app uses internal endpoint `POST /v1/analyze-web` (no API key input in UI).
+- Web app supports `POST /v1/search-web` via button `Søg Produkt` (viser flere tilbud).
 - Web app supports `POST /v1/extract-web`:
   - paste product URL
   - tap `Hent data fra link`

@@ -559,6 +559,18 @@ class AnalyzeResponse(BaseModel):
     excluded_results: int
 
 
+class SearchRequest(AnalyzeRequest):
+    limit: int = Field(default=20, ge=1, le=50)
+
+
+class SearchResponse(BaseModel):
+    query_type: str
+    currency: str
+    total_matches: int
+    excluded_results: int
+    offers: List[Alternative]
+
+
 def cache_key(payload: AnalyzeRequest, query: Optional[str] = None) -> str:
     identity = payload.gtin13 or payload.gtin8 or payload.sku or payload.product_name or "unknown"
     query_part = query or identity
@@ -886,40 +898,50 @@ def extract_web(payload: ExtractUrlRequest) -> ExtractUrlResponse:
     return extract_product_data_from_url(payload.url)
 
 
-def analyze_impl(payload: AnalyzeRequest) -> AnalyzeResponse:
-    # Product logic is Denmark-only by requirement.
-    payload = payload.model_copy(update={"country": DEFAULT_COUNTRY, "currency": DEFAULT_CURRENCY})
-    currency = DEFAULT_CURRENCY
-    query, query_type = build_search_query(payload)
+def normalize_payload_for_denmark(payload: AnalyzeRequest) -> AnalyzeRequest:
+    return payload.model_copy(update={"country": DEFAULT_COUNTRY, "currency": DEFAULT_CURRENCY})
 
+
+def resolve_alternatives(payload: AnalyzeRequest, currency: str) -> tuple[List[Alternative], int, str]:
+    query, query_type = build_search_query(payload)
     search_variants: List[tuple[str, str]] = [(query, query_type)]
     if query_type in {"gtin_exact", "sku_brand", "sku"} and payload.product_name:
         if payload.brand:
             search_variants.append((f'"{payload.brand}" {payload.product_name}', "name_brand_fuzzy_fallback"))
         search_variants.append((payload.product_name, "name_fuzzy_fallback"))
 
-    try:
-        alternatives: List[Alternative] = []
-        excluded = 0
-        selected_query_type = query_type
+    alternatives: List[Alternative] = []
+    excluded = 0
+    selected_query_type = query_type
 
-        # Try primary search first; fallback from SKU to name-based search when matches collapse to zero.
-        for search_query, variant_type in search_variants:
-            key = cache_key(payload, search_query)
-            raw_results = get_cached(key)
-            if raw_results is None:
-                raw_results = call_serpapi(query=search_query, country=payload.country, currency=currency)
-                set_cached(key, raw_results)
+    # Try primary search first; fallback from SKU/GTIN to name-based search when matches collapse to zero.
+    for search_query, variant_type in search_variants:
+        key = cache_key(payload, search_query)
+        raw_results = get_cached(key)
+        if raw_results is None:
+            raw_results = call_serpapi(query=search_query, country=payload.country, currency=currency)
+            set_cached(key, raw_results)
 
-            current_alts, current_excluded = parse_and_filter_results(payload, raw_results)
-            if current_alts:
-                alternatives = current_alts
-                excluded = current_excluded
-                selected_query_type = variant_type
-                break
-
-            # Preserve the latest excluded count for diagnostics if all variants fail.
+        current_alts, current_excluded = parse_and_filter_results(payload, raw_results)
+        if current_alts:
+            alternatives = current_alts
             excluded = current_excluded
+            selected_query_type = variant_type
+            break
+
+        # Preserve the latest excluded count for diagnostics if all variants fail.
+        excluded = current_excluded
+
+    return alternatives, excluded, selected_query_type
+
+
+def analyze_impl(payload: AnalyzeRequest) -> AnalyzeResponse:
+    # Product logic is Denmark-only by requirement.
+    payload = normalize_payload_for_denmark(payload)
+    currency = DEFAULT_CURRENCY
+
+    try:
+        alternatives, excluded, selected_query_type = resolve_alternatives(payload, currency)
 
         market_min_price = alternatives[0].price if alternatives else None
         market_avg_price = mean([a.price for a in alternatives]) if alternatives else None
@@ -948,6 +970,27 @@ def analyze_impl(payload: AnalyzeRequest) -> AnalyzeResponse:
         raise HTTPException(status_code=500, detail=f"Unexpected error: {exc}") from exc
 
 
+def search_impl(payload: SearchRequest) -> SearchResponse:
+    base_payload = AnalyzeRequest.model_validate(payload.model_dump(exclude={"limit"}))
+    base_payload = normalize_payload_for_denmark(base_payload)
+    currency = DEFAULT_CURRENCY
+
+    try:
+        alternatives, excluded, selected_query_type = resolve_alternatives(base_payload, currency)
+        return SearchResponse(
+            query_type=selected_query_type,
+            currency=currency,
+            total_matches=len(alternatives),
+            excluded_results=excluded,
+            offers=alternatives[: payload.limit],
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Unhandled search failure")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {exc}") from exc
+
+
 @app.post("/v1/analyze", response_model=AnalyzeResponse)
 def analyze(payload: AnalyzeRequest, x_api_key: Optional[str] = Header(default=None)) -> AnalyzeResponse:
     if not API_KEY:
@@ -960,3 +1003,17 @@ def analyze(payload: AnalyzeRequest, x_api_key: Optional[str] = Header(default=N
 @app.post("/v1/analyze-web", response_model=AnalyzeResponse, include_in_schema=False)
 def analyze_web(payload: AnalyzeRequest) -> AnalyzeResponse:
     return analyze_impl(payload)
+
+
+@app.post("/v1/search", response_model=SearchResponse)
+def search(payload: SearchRequest, x_api_key: Optional[str] = Header(default=None)) -> SearchResponse:
+    if not API_KEY:
+        raise HTTPException(status_code=500, detail="API_KEY is not configured")
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    return search_impl(payload)
+
+
+@app.post("/v1/search-web", response_model=SearchResponse, include_in_schema=False)
+def search_web(payload: SearchRequest) -> SearchResponse:
+    return search_impl(payload)
