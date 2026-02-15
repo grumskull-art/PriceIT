@@ -54,6 +54,8 @@ DEFAULT_COUNTRY = "dk"
 DEFAULT_CURRENCY = "DKK"
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "1800"))
 LLM_QUERY_CACHE_TTL_SECONDS = int(os.getenv("LLM_QUERY_CACHE_TTL_SECONDS", "21600"))
+SERPAPI_MAX_RETRIES = int(os.getenv("SERPAPI_MAX_RETRIES", "3"))
+SERPAPI_RETRY_BACKOFF_SECONDS = float(os.getenv("SERPAPI_RETRY_BACKOFF_SECONDS", "0.5"))
 ALLOWED_CROSS_BORDER_SOURCES = {"amazon.de", "next.co.uk"}
 BLOCKED_SOURCES = {"ebay"}
 PREFERRED_CHILD_STORES = {
@@ -710,6 +712,7 @@ class AnalyzeResponse(BaseModel):
     savings_vs_min: Optional[float]
     top_3_alternatives: List[Alternative]
     excluded_results: int
+    excluded_reasons: Dict[str, int] = Field(default_factory=dict)
 
 
 class SearchRequest(AnalyzeRequest):
@@ -721,6 +724,7 @@ class SearchResponse(BaseModel):
     currency: str
     total_matches: int
     excluded_results: int
+    excluded_reasons: Dict[str, int] = Field(default_factory=dict)
     offers: List[Alternative]
 
 
@@ -878,8 +882,8 @@ def get_auto_query_variants(payload: AnalyzeRequest) -> List[str]:
     if cached is not None:
         return cached
     queries = request_llm_query_variants(payload)
-    if queries:
-        set_llm_cached(key, queries)
+    # Cache empty responses too to avoid repeated slow/noisy LLM retries.
+    set_llm_cached(key, queries)
     return queries
 
 
@@ -1010,17 +1014,59 @@ def call_serpapi(query: str, country: str, currency: str) -> List[Dict[str, Any]
     if currency:
         params["currency"] = currency
 
-    try:
-        search = GoogleSearch(params)
-        data = search.get_dict()
-    except Exception as exc:  # network/timeouts and client errors
-        logger.exception("SerpApi call failed")
-        raise HTTPException(status_code=502, detail=f"Search provider failure: {exc}") from exc
+    retries = max(1, SERPAPI_MAX_RETRIES)
+    last_error: Optional[Exception] = None
+    for attempt in range(1, retries + 1):
+        try:
+            search = GoogleSearch(params)
+            data = search.get_dict()
+            if not isinstance(data, dict):
+                raise HTTPException(status_code=502, detail="Malformed search response")
 
-    if not isinstance(data, dict):
-        raise HTTPException(status_code=502, detail="Malformed search response")
+            error_text = str(data.get("error") or "").lower()
+            should_retry = (
+                "429" in error_text
+                or "rate" in error_text
+                or "limit" in error_text
+                or "403" in error_text
+                or "temporar" in error_text
+                or "timeout" in error_text
+            )
+            if should_retry and attempt < retries:
+                sleep_s = SERPAPI_RETRY_BACKOFF_SECONDS * attempt
+                logger.warning(
+                    "SerpApi retryable error for query '%s' (attempt %s/%s): %s",
+                    query,
+                    attempt,
+                    retries,
+                    error_text,
+                )
+                time.sleep(max(0.0, sleep_s))
+                continue
 
-    return data.get("shopping_results", []) or []
+            if error_text:
+                raise HTTPException(status_code=502, detail=f"Search provider failure: {data.get('error')}")
+
+            return data.get("shopping_results", []) or []
+        except HTTPException:
+            raise
+        except Exception as exc:  # network/timeouts and client errors
+            last_error = exc
+            if attempt < retries:
+                sleep_s = SERPAPI_RETRY_BACKOFF_SECONDS * attempt
+                logger.warning(
+                    "SerpApi call failed (attempt %s/%s) for query '%s': %s",
+                    attempt,
+                    retries,
+                    query,
+                    exc,
+                )
+                time.sleep(max(0.0, sleep_s))
+                continue
+            logger.exception("SerpApi call failed")
+            raise HTTPException(status_code=502, detail=f"Search provider failure: {exc}") from exc
+
+    raise HTTPException(status_code=502, detail=f"Search provider failure: {last_error}")
 
 
 def parse_price(raw: Any) -> Optional[float]:
@@ -1463,14 +1509,26 @@ def extract_image_url(raw_result: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def parse_and_filter_results(payload: AnalyzeRequest, raw_results: List[Dict[str, Any]]) -> tuple[List[Alternative], int]:
+def parse_and_filter_results(
+    payload: AnalyzeRequest,
+    raw_results: List[Dict[str, Any]],
+) -> tuple[List[Alternative], int, Dict[str, int]]:
     filtered: List[Alternative] = []
     excluded = 0
+    excluded_reasons: Dict[str, int] = {}
+
+    def exclude(reason: str) -> None:
+        nonlocal excluded
+        excluded += 1
+        excluded_reasons[reason] = excluded_reasons.get(reason, 0) + 1
 
     for r in raw_results:
         title = str(r.get("title", "")).strip()
         source = str(r.get("source", "Unknown shop")).strip() or "Unknown shop"
         link = str(r.get("link") or r.get("product_link") or "").strip()
+        if not link.lower().startswith(("http://", "https://")):
+            exclude("invalid_link")
+            continue
         condition = " ".join(
             [
                 str(r.get("condition", "")).lower(),
@@ -1481,58 +1539,54 @@ def parse_and_filter_results(payload: AnalyzeRequest, raw_results: List[Dict[str
 
         price = parse_price(r.get("price") or r.get("extracted_price"))
         if price is None or not link:
-            excluded += 1
+            exclude("missing_price_or_link")
             continue
         shipping_price = parse_shipping_price(r.get("shipping"), r.get("delivery"))
         total_price = round(price + shipping_price, 2)
 
         if payload.country.lower() == "dk":
             if not is_allowed_source_for_denmark(source, shipping, link):
-                excluded += 1
+                exclude("not_allowed_in_denmark")
                 continue
 
         if not matches_store_filters(source=source, link=link, store_filters=payload.store_filters):
-            excluded += 1
+            exclude("store_filter_mismatch")
             continue
 
         if ("used" in condition or "used" in title.lower()) and not payload.include_used:
-            excluded += 1
+            exclude("used_filtered")
             continue
 
         if ("refurbished" in condition or "refurbished" in title.lower()) and not payload.include_refurbished:
-            excluded += 1
+            exclude("refurbished_filtered")
             continue
 
         if payload.brand and not has_brand_match(payload.brand, title=title, source=source, link=link):
-            excluded += 1
+            exclude("brand_mismatch")
             continue
 
         if has_product_type_conflict(payload.product_name, title):
-            excluded += 1
+            exclude("product_type_conflict")
             continue
 
         if not has_required_feature_match(payload.product_name, title):
-            excluded += 1
+            exclude("required_feature_missing")
             continue
 
         if has_color_conflict(payload.product_name, title, link):
-            excluded += 1
+            exclude("color_conflict")
             continue
 
         if not has_age_size_compatibility(payload.product_name, title):
-            excluded += 1
-            continue
-
-        if extract_age_years(payload.product_name) and has_broad_size_range(title) and not extract_age_years(title):
-            excluded += 1
+            exclude("age_or_size_mismatch")
             continue
 
         if not has_signature_model_match(payload, title=title):
-            excluded += 1
+            exclude("signature_model_missing")
             continue
 
         if contains_accessory_signal(payload.product_name, title):
-            excluded += 1
+            exclude("accessory_mismatch")
             continue
 
         if payload.gtin13 or payload.gtin8:
@@ -1540,17 +1594,17 @@ def parse_and_filter_results(payload: AnalyzeRequest, raw_results: List[Dict[str
             if gtin and gtin not in json.dumps(r).replace(" ", ""):
                 # keep result if Google omitted gtin in blob but only when title strongly matches
                 if is_wrong_model(payload, title):
-                    excluded += 1
+                    exclude("wrong_model")
                     continue
         elif payload.product_name and is_wrong_model(payload, title):
-            excluded += 1
+            exclude("wrong_model")
             continue
 
         match_score = compute_match_score(payload, title=title, source=source, link=link)
         if match_score < minimum_match_score(payload):
-            excluded += 1
+            exclude("match_score_too_low")
             continue
-	
+
         filtered.append(
             Alternative(
                 shop=source,
@@ -1570,7 +1624,7 @@ def parse_and_filter_results(payload: AnalyzeRequest, raw_results: List[Dict[str
         filtered = preferred
 
     filtered.sort(key=lambda x: (-(x.match_score or 0.0), x.price))
-    return filtered, excluded
+    return filtered, excluded, excluded_reasons
 
 
 def decide_verdict(current_page_price: Optional[float], market_min: Optional[float], market_avg: Optional[float]) -> str:
@@ -1630,23 +1684,32 @@ def dedupe_alternatives(alternatives: List[Alternative]) -> List[Alternative]:
     for alt in alternatives:
         key = alternative_dedupe_key(alt)
         existing = deduped.get(key)
-        if existing is None or alt.price < existing.price:
+        if existing is None:
             deduped[key] = alt
-    return sorted(deduped.values(), key=lambda x: x.price)
+            continue
+        existing_score = existing.match_score or 0.0
+        candidate_score = alt.match_score or 0.0
+        if candidate_score > existing_score:
+            deduped[key] = alt
+            continue
+        if candidate_score == existing_score and alt.price < existing.price:
+            deduped[key] = alt
+    return sorted(deduped.values(), key=lambda x: (-(x.match_score or 0.0), x.price))
 
 
-def resolve_alternatives(payload: AnalyzeRequest, currency: str) -> tuple[List[Alternative], int, str]:
+def resolve_alternatives(payload: AnalyzeRequest, currency: str) -> tuple[List[Alternative], int, Dict[str, int], str]:
     search_variants = build_search_variants(payload)
     if not search_variants:
         raise HTTPException(status_code=400, detail="No valid search variants available")
 
     all_alternatives: List[Alternative] = []
     excluded_total = 0
+    excluded_reasons_total: Dict[str, int] = {}
     selected_query_type = search_variants[0][1]
     processed_queries: set[str] = set()
 
     def run_variants(variants: List[tuple[str, str]]) -> None:
-        nonlocal excluded_total, selected_query_type, all_alternatives
+        nonlocal excluded_total, selected_query_type, all_alternatives, excluded_reasons_total
         for search_query, variant_type in variants:
             normalized_query = clean_query_text(search_query)
             query_key = normalized_query.lower()
@@ -1660,8 +1723,10 @@ def resolve_alternatives(payload: AnalyzeRequest, currency: str) -> tuple[List[A
                 raw_results = call_serpapi(query=normalized_query, country=payload.country, currency=currency)
                 set_cached(key, raw_results)
 
-            current_alts, current_excluded = parse_and_filter_results(payload, raw_results)
+            current_alts, current_excluded, current_reasons = parse_and_filter_results(payload, raw_results)
             excluded_total += current_excluded
+            for reason, count in current_reasons.items():
+                excluded_reasons_total[reason] = excluded_reasons_total.get(reason, 0) + count
             if current_alts:
                 if not all_alternatives:
                     selected_query_type = variant_type
@@ -1676,7 +1741,7 @@ def resolve_alternatives(payload: AnalyzeRequest, currency: str) -> tuple[List[A
         if auto_variants:
             run_variants(build_search_variants(payload, extra_variants=auto_variants))
 
-    return dedupe_alternatives(all_alternatives), excluded_total, selected_query_type
+    return dedupe_alternatives(all_alternatives), excluded_total, excluded_reasons_total, selected_query_type
 
 
 def analyze_impl(payload: AnalyzeRequest) -> AnalyzeResponse:
@@ -1685,7 +1750,7 @@ def analyze_impl(payload: AnalyzeRequest) -> AnalyzeResponse:
     currency = DEFAULT_CURRENCY
 
     try:
-        alternatives, excluded, selected_query_type = resolve_alternatives(payload, currency)
+        alternatives, excluded, excluded_reasons, selected_query_type = resolve_alternatives(payload, currency)
 
         market_min_price = min((a.price for a in alternatives), default=None)
         market_avg_price = mean([a.price for a in alternatives]) if alternatives else None
@@ -1706,6 +1771,7 @@ def analyze_impl(payload: AnalyzeRequest) -> AnalyzeResponse:
             savings_vs_min=savings,
             top_3_alternatives=alternatives[:3],
             excluded_results=excluded,
+            excluded_reasons=excluded_reasons,
         )
     except HTTPException:
         raise
@@ -1720,12 +1786,13 @@ def search_impl(payload: SearchRequest) -> SearchResponse:
     currency = DEFAULT_CURRENCY
 
     try:
-        alternatives, excluded, selected_query_type = resolve_alternatives(base_payload, currency)
+        alternatives, excluded, excluded_reasons, selected_query_type = resolve_alternatives(base_payload, currency)
         return SearchResponse(
             query_type=selected_query_type,
             currency=currency,
             total_matches=len(alternatives),
             excluded_results=excluded,
+            excluded_reasons=excluded_reasons,
             offers=alternatives[: payload.limit],
         )
     except HTTPException:

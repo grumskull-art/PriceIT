@@ -227,6 +227,16 @@
       font-size: 12px;
       color: var(--muted);
     }
+
+    .no-match {
+      border: 1px solid #ecd6b5;
+      background: #fff8ec;
+      border-radius: 12px;
+      padding: 10px;
+      margin-top: 10px;
+      font-size: 13px;
+      color: #6a4b16;
+    }
   </style>
 </head>
 <body>
@@ -365,6 +375,24 @@
         if (unique.length >= 10) break;
       }
       return unique.length ? unique : null;
+    }
+
+    function formatExcludedReasons(reasons) {
+      if (!reasons || typeof reasons !== "object") return "-";
+      const entries = Object.entries(reasons).sort((a, b) => b[1] - a[1]);
+      if (!entries.length) return "-";
+      return entries.slice(0, 5).map(([key, count]) => `${key}:${count}`).join(", ");
+    }
+
+    function noMatchExplanation(reasons) {
+      if (!reasons || typeof reasons !== "object") {
+        return "Prøv med mere præcist produktnavn, brand og evt. SKU/GTIN.";
+      }
+      if ((reasons.color_conflict || 0) > 0) return "Farve matcher ikke. Angiv præcis farve eller fjern farveord.";
+      if ((reasons.product_type_conflict || 0) > 0) return "Produkttype matcher ikke. Brug mere specifik type.";
+      if ((reasons.age_or_size_mismatch || 0) > 0) return "Størrelse/alder matcher ikke. Tilføj størrelse/alder i søgningen.";
+      if ((reasons.brand_mismatch || 0) > 0 || (reasons.signature_model_missing || 0) > 0) return "Brand/model matcher ikke. Tilføj brand + model/SKU.";
+      return "Ingen sikre match i DK-butikker. Prøv færre filtre eller anden query-pack.";
     }
 
     function hideResult() {
@@ -517,8 +545,9 @@
         </div>
         <div><strong>Query type:</strong> ${esc(data.query_type)}</div>
         <div><strong>Filtrerede resultater:</strong> ${esc(data.excluded_results)}</div>
-        <div class="hint">Top alternativer</div>
-        ${alternatives || "<div class=\"alt\">Ingen alternativer fundet.</div>"}
+        <div><strong>Frasorteringsårsager:</strong> ${esc(formatExcludedReasons(data.excluded_reasons))}</div>
+        <div class="hint">Top alternativer (sorteret på relevans først, pris sekundært)</div>
+        ${alternatives || `<div class="no-match"><strong>Ingen match fundet.</strong><br>${esc(noMatchExplanation(data.excluded_reasons))}</div>`}
       `;
       resultEl.style.display = "block";
     }
@@ -547,8 +576,9 @@
         <div><strong>Query type:</strong> ${esc(data.query_type)}</div>
         <div><strong>Match:</strong> ${esc(data.total_matches)}</div>
         <div><strong>Filtrerede resultater:</strong> ${esc(data.excluded_results)}</div>
-        <div class="hint">Top tilbud (total inkl. fragt)</div>
-        ${offers || "<div class=\"alt\">Ingen tilbud fundet.</div>"}
+        <div><strong>Frasorteringsårsager:</strong> ${esc(formatExcludedReasons(data.excluded_reasons))}</div>
+        <div class="hint">Top tilbud (sorteret på relevans først, pris sekundært)</div>
+        ${offers || `<div class="no-match"><strong>Ingen match fundet.</strong><br>${esc(noMatchExplanation(data.excluded_reasons))}</div>`}
       `;
       resultEl.style.display = "block";
     }
