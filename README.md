@@ -6,6 +6,7 @@ High-precision price intelligence API + iOS Share Extension extraction script.
 - `main.py` – FastAPI backend with SerpApi shopping analysis.
 - `extension_preprocessing.js` – `NSExtensionJavaScriptPreprocessingJS` logic with JSON-LD-first extraction.
 - `.env.example` – env var structure for API key + SerpApi key.
+- `GPT_QUERY_PROMPT.md` – prompt template for generating query variants in GPT.
 
 ## Backend quick start
 ```bash
@@ -21,6 +22,8 @@ uvicorn main:app --reload --port 8000
 - Root `/` redirects to `/app`.
 - Web app uses internal endpoint `POST /v1/analyze-web` (no API key input in UI).
 - Web app supports `POST /v1/search-web` via button `Søg Produkt` (viser flere tilbud).
+- Web app har hurtigt `Butiksfilter` (Zalando/Next/Name It/Børnesider).
+- Web app har `GPT query-pack` felt (valgfrit): indsæt én søge-variant pr linje, eller lad tom for auto query-boost.
 - Web app supports `POST /v1/extract-web`:
   - paste product URL
   - tap `Hent data fra link`
@@ -60,9 +63,35 @@ Sample payload:
 
 ## Notes
 - GTIN is prioritized over all other identifiers.
-- Fuzzy matching includes strict filtering to reduce accessories/wrong models.
+- Fuzzy matching now uses stricter relevance scoring (type/feature/color/age-size/brand) to reduce wrong products.
 - Used/refurbished products are excluded by default.
 - Current caching is in-memory; for production, replace cache helpers with Redis.
+- Auto query-boost via OpenAI er valgfri:
+  - `OPENAI_API_KEY=<din nøgle>`
+  - `OPENAI_MODEL=gpt-4o-mini` (kan ændres)
+
+## GPT Prompt (Query Pack)
+Brug denne prompt i GPT og copy/paste outputtet ind i feltet `GPT query-pack` i appen.
+
+```text
+Du er query-generator for dansk e-commerce prissøgning.
+Lav 8 korte søgequeries for samme produkt.
+
+Krav:
+- Fokus på danske butikker og shopping-søgning.
+- Behold brand/model hvis kendt.
+- Lav variationer af produkttype (fx hoodie/sweatshirt/sweater).
+- Lav variationer af farveord (fx blå/blue/royal/navy), men kun relevante.
+- Fjern støj (fx køn/alder ord) i nogle varianter.
+- Ingen forklaringer.
+- Output kun rå queries, én pr linje.
+
+Input:
+Produktnavn: <indsæt>
+Brand: <indsæt eller tom>
+SKU: <indsæt eller tom>
+GTIN: <indsæt eller tom>
+```
 
 ## iOS Share Extension Wiring
 - Full setup guide: `IOS_SHARE_EXTENSION_SETUP.md`

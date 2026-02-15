@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import math
 import os
@@ -28,11 +29,31 @@ except ImportError:  # fallback for older package style
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("shopping-politiet")
 
+
+def load_local_env_file(env_path: Path) -> None:
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+load_local_env_file(Path(__file__).resolve().parent / ".env")
+
 API_KEY = os.getenv("API_KEY", "")
 SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 DEFAULT_COUNTRY = "dk"
 DEFAULT_CURRENCY = "DKK"
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "1800"))
+LLM_QUERY_CACHE_TTL_SECONDS = int(os.getenv("LLM_QUERY_CACHE_TTL_SECONDS", "21600"))
 ALLOWED_CROSS_BORDER_SOURCES = {"amazon.de", "next.co.uk"}
 BLOCKED_SOURCES = {"ebay"}
 PREFERRED_CHILD_STORES = {
@@ -46,6 +67,59 @@ PREFERRED_CHILD_STORES = {
     "kidsworld",
     "luksusbaby",
 }
+MAX_QUERY_VARIANTS = 10
+EARLY_STOP_MIN_UNIQUE_MATCHES = 8
+LLM_QUERY_TRIGGER_MIN_MATCHES = 3
+QUERY_TERM_GROUPS = [
+    {"hoodie", "sweatshirt", "sweater", "jumper", "trøje", "troeje"},
+    {"blå", "blaa", "blue", "royal", "navy"},
+]
+QUERY_STRIP_TOKENS = {
+    "dreng",
+    "drenge",
+    "boy",
+    "boys",
+    "pige",
+    "piger",
+    "girl",
+    "girls",
+    "barn",
+    "børn",
+    "boern",
+    "kid",
+    "kids",
+}
+PRODUCT_TYPE_GROUPS: Dict[str, set[str]] = {
+    "winter_boot": {"vinterstøvle", "vinterstøvler", "winter boot", "winter boots", "snow boot", "snow boots"},
+    "rain_boot": {"gummistøvle", "gummistøvler", "rain boot", "rain boots", "wellies", "wellington"},
+    "boot_general": {"støvle", "støvler", "boot", "boots"},
+    "shoe": {"sko", "shoe", "shoes", "sneaker", "sneakers", "trainer", "trainers"},
+    "hoodie_top": {"hoodie", "sweatshirt", "sweater", "jumper", "trøje", "troeje"},
+    "jacket": {"jakke", "jacket", "coat", "anorak", "parka"},
+    "sandals": {"sandal", "sandaler", "sandals"},
+}
+PRODUCT_FEATURE_GROUPS: Dict[str, set[str]] = {
+    "winter": {"vinter", "winter", "snow", "sne"},
+    "waterproof": {"vandtæt", "vandtætte", "waterproof", "gtx", "gore-tex", "goretex"},
+    "rain": {"regn", "rain", "gummi", "wellies", "wellington"},
+}
+COLOR_GROUPS: Dict[str, set[str]] = {
+    "black": {"black", "sort", "noir", "nero"},
+    "grey": {"grey", "gray", "grå", "gra", "antracit", "anthracite"},
+    "white": {"white", "hvid", "blanc"},
+    "blue": {"blue", "blå", "blaa", "navy", "royal", "indigo", "marine"},
+    "red": {"red", "rød", "roed", "burgundy", "bordeaux"},
+    "green": {"green", "grøn", "groen", "olive", "khaki"},
+    "pink": {"pink", "rosa", "fuchsia"},
+    "purple": {"purple", "lilla", "violet"},
+    "yellow": {"yellow", "gul"},
+    "orange": {"orange"},
+    "brown": {"brown", "brun", "tan", "cognac"},
+    "beige": {"beige", "sand", "cream", "creme", "ivory"},
+}
+MIN_MATCH_SCORE_DEFAULT = 0.50
+MIN_MATCH_SCORE_BRAND = 0.58
+MIN_MATCH_SCORE_STRONG_ID = 0.40
 TOKEN_STOPWORDS = {
     "the",
     "and",
@@ -63,11 +137,39 @@ TOKEN_STOPWORDS = {
     "child",
     "children",
 }
+GENERIC_APPAREL_QUERY_TOKENS = {
+    "hoodie",
+    "sweatshirt",
+    "sweater",
+    "jumper",
+    "shirt",
+    "trøje",
+    "troeje",
+    "blå",
+    "blaa",
+    "blue",
+    "royal",
+    "navy",
+    "dreng",
+    "drenge",
+    "boy",
+    "boys",
+    "pige",
+    "piger",
+    "girl",
+    "girls",
+    "barn",
+    "børn",
+    "boern",
+    "kid",
+    "kids",
+}
 NON_DISTINCTIVE_MODEL_TOKENS = {
     "gtx",
     "gore",
     "tex",
     "warm",
+    "vinter",
     "winter",
     "snow",
     "shoe",
@@ -116,6 +218,7 @@ WEBAPP_INDEX = Path(__file__).resolve().parent / "webapp" / "index.html"
 
 # Simple in-memory cache. In production, replace with Redis for shared, multi-instance cache.
 CACHE: Dict[str, Dict[str, Any]] = {}
+LLM_QUERY_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
 def parse_localized_price(value: str) -> Optional[float]:
@@ -479,6 +582,8 @@ class AnalyzeRequest(BaseModel):
     gtin13: Optional[str] = None
     gtin8: Optional[str] = None
     sku: Optional[str] = None
+    store_filters: Optional[List[str]] = None
+    query_variants: Optional[List[str]] = None
     country: str = Field(default=DEFAULT_COUNTRY, min_length=2, max_length=2)
     include_used: bool = False
     include_refurbished: bool = False
@@ -513,6 +618,52 @@ class AnalyzeRequest(BaseModel):
         s = str(value).strip()
         return s or None
 
+    @field_validator("store_filters", mode="before")
+    @classmethod
+    def normalize_store_filters(cls, value: Any) -> Optional[List[str]]:
+        if value is None or value == "":
+            return None
+        if isinstance(value, str):
+            values = [value]
+        elif isinstance(value, (list, tuple, set)):
+            values = list(value)
+        else:
+            raise ValueError("store_filters must be a list of strings")
+
+        cleaned: List[str] = []
+        for item in values:
+            marker = str(item).strip().lower()
+            if marker and marker not in cleaned:
+                cleaned.append(marker)
+        return cleaned or None
+
+    @field_validator("query_variants", mode="before")
+    @classmethod
+    def normalize_query_variants(cls, value: Any) -> Optional[List[str]]:
+        if value is None or value == "":
+            return None
+        if isinstance(value, str):
+            values = [value]
+        elif isinstance(value, (list, tuple, set)):
+            values = list(value)
+        else:
+            raise ValueError("query_variants must be a list of strings")
+
+        cleaned: List[str] = []
+        seen: set[str] = set()
+        for item in values:
+            query = str(item).strip()
+            if not query:
+                continue
+            query_key = query.lower()
+            if query_key in seen:
+                continue
+            seen.add(query_key)
+            cleaned.append(query)
+            if len(cleaned) >= MAX_QUERY_VARIANTS:
+                break
+        return cleaned or None
+
 
 class ExtractUrlRequest(BaseModel):
     url: str = Field(min_length=8, max_length=2048)
@@ -545,6 +696,8 @@ class Alternative(BaseModel):
     title: Optional[str] = None
     item_price: Optional[float] = None
     shipping_price: float = 0.0
+    image_url: Optional[str] = None
+    match_score: Optional[float] = None
 
 
 class AnalyzeResponse(BaseModel):
@@ -591,6 +744,145 @@ def set_cached(key: str, results: List[Dict[str, Any]]) -> None:
     CACHE[key] = {"ts": time.time(), "results": results}
 
 
+def llm_cache_key(payload: AnalyzeRequest) -> str:
+    identity = {
+        "product_name": payload.product_name or "",
+        "brand": payload.brand or "",
+        "sku": payload.sku or "",
+        "gtin13": payload.gtin13 or "",
+        "gtin8": payload.gtin8 or "",
+        "store_filters": payload.store_filters or [],
+    }
+    digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()[:24]
+    return f"llm:{digest}"
+
+
+def get_llm_cached(key: str) -> Optional[List[str]]:
+    record = LLM_QUERY_CACHE.get(key)
+    if not record:
+        return None
+    if time.time() - record["ts"] > LLM_QUERY_CACHE_TTL_SECONDS:
+        LLM_QUERY_CACHE.pop(key, None)
+        return None
+    queries = record.get("queries")
+    if not isinstance(queries, list):
+        return None
+    return [str(q) for q in queries if str(q).strip()]
+
+
+def set_llm_cached(key: str, queries: List[str]) -> None:
+    LLM_QUERY_CACHE[key] = {"ts": time.time(), "queries": queries}
+
+
+def normalize_query_lines(raw_text: str) -> List[str]:
+    lines = re.split(r"[\r\n]+", raw_text)
+    cleaned: List[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        item = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip()
+        item = clean_query_text(item)
+        if not item:
+            continue
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(item)
+        if len(cleaned) >= MAX_QUERY_VARIANTS:
+            break
+    return cleaned
+
+
+def build_query_boost_prompt(payload: AnalyzeRequest) -> str:
+    return (
+        "Du er query-generator for dansk e-commerce prissøgning.\n"
+        "Lav 8 korte søgequeries for samme produkt.\n\n"
+        "Krav:\n"
+        "- Fokus på danske butikker og shopping-søgning.\n"
+        "- Behold brand/model hvis kendt.\n"
+        "- Lav variationer af produkttype (fx hoodie/sweatshirt/sweater).\n"
+        "- Lav variationer af farveord (fx blå/blue/royal/navy), men kun relevante.\n"
+        "- Fjern støj (fx køn/alder ord) i nogle varianter.\n"
+        "- Ingen forklaringer.\n"
+        "- Output kun rå queries, én pr linje.\n\n"
+        f"Produktnavn: {payload.product_name or ''}\n"
+        f"Brand: {payload.brand or ''}\n"
+        f"SKU: {payload.sku or ''}\n"
+        f"GTIN: {payload.gtin13 or payload.gtin8 or ''}\n"
+    )
+
+
+def extract_response_output_text(data: Dict[str, Any]) -> str:
+    output_text = data.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text
+
+    chunks: List[str] = []
+    for item in data.get("output", []) if isinstance(data.get("output"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        for content in item.get("content", []) if isinstance(item.get("content"), list) else []:
+            if not isinstance(content, dict):
+                continue
+            for key in ("text", "output_text"):
+                value = content.get(key)
+                if isinstance(value, str) and value.strip():
+                    chunks.append(value.strip())
+    return "\n".join(chunks)
+
+
+def request_llm_query_variants(payload: AnalyzeRequest) -> List[str]:
+    if not OPENAI_API_KEY or not payload.product_name:
+        return []
+
+    prompt = build_query_boost_prompt(payload)
+    body = {
+        "model": OPENAI_MODEL,
+        "input": [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": prompt}],
+            }
+        ],
+        "max_output_tokens": 220,
+    }
+
+    req = Request(
+        url="https://api.openai.com/v1/responses",
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+        },
+        method="POST",
+    )
+
+    try:
+        with urlopen(req, timeout=18) as response:
+            charset = response.headers.get_content_charset() or "utf-8"
+            data = json.loads(response.read().decode(charset, errors="replace"))
+    except Exception as exc:
+        logger.warning("LLM query boost failed: %s", exc)
+        return []
+
+    if not isinstance(data, dict):
+        return []
+    return normalize_query_lines(extract_response_output_text(data))
+
+
+def get_auto_query_variants(payload: AnalyzeRequest) -> List[str]:
+    if not OPENAI_API_KEY or not payload.product_name:
+        return []
+    key = llm_cache_key(payload)
+    cached = get_llm_cached(key)
+    if cached is not None:
+        return cached
+    queries = request_llm_query_variants(payload)
+    if queries:
+        set_llm_cached(key, queries)
+    return queries
+
+
 def build_search_query(payload: AnalyzeRequest) -> tuple[str, str]:
     gtin = payload.gtin13 or payload.gtin8
     if gtin:
@@ -604,6 +896,103 @@ def build_search_query(payload: AnalyzeRequest) -> tuple[str, str]:
             return f'"{payload.brand}" {payload.product_name}', "name_brand_fuzzy"
         return payload.product_name, "name_fuzzy"
     raise HTTPException(status_code=400, detail="One of gtin, sku, or product_name is required")
+
+
+def clean_query_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def expand_term_group(query: str, group: set[str]) -> List[str]:
+    query_l = query.lower()
+    hits = [term for term in group if re.search(rf"\b{re.escape(term)}\b", query_l)]
+    if not hits:
+        return []
+
+    variants: List[str] = []
+    for hit in hits:
+        for replacement in group:
+            if replacement == hit:
+                continue
+            variant = re.sub(
+                rf"\b{re.escape(hit)}\b",
+                replacement,
+                query,
+                flags=re.IGNORECASE,
+            )
+            variant = clean_query_text(variant)
+            if variant and variant.lower() != query_l:
+                variants.append(variant)
+    return variants
+
+
+def strip_age_size_tokens(query: str) -> str:
+    q = query
+    q = re.sub(r"\b\d{1,3}\s*(?:år|aar|yrs?|year|years)\b", " ", q, flags=re.IGNORECASE)
+    q = re.sub(r"\b\d{2,3}\s*/\s*\d{2,3}\b", " ", q)
+    q = re.sub(r"\b(?:str|size)\s*[:.]?\s*\d{2,3}(?:\s*/\s*\d{2,3})?\b", " ", q, flags=re.IGNORECASE)
+    q = re.sub(r"\b\d{2,3}\s*cm\b", " ", q, flags=re.IGNORECASE)
+    return clean_query_text(q)
+
+
+def strip_generic_query_tokens(query: str) -> str:
+    words = [w for w in re.findall(r"\w+", query, flags=re.UNICODE) if w.lower() not in QUERY_STRIP_TOKENS]
+    return clean_query_text(" ".join(words))
+
+
+def build_search_variants(payload: AnalyzeRequest, extra_variants: Optional[List[str]] = None) -> List[tuple[str, str]]:
+    base_query, base_type = build_search_query(payload)
+    variants: List[tuple[str, str]] = [(base_query, base_type)]
+
+    if payload.query_variants:
+        for query in payload.query_variants:
+            variants.append((query, "gpt_variant"))
+    if extra_variants:
+        for query in extra_variants:
+            variants.append((query, "llm_auto"))
+
+    if payload.product_name:
+        base_name = clean_query_text(payload.product_name)
+        heuristic_names: List[str] = [base_name]
+
+        stripped_age = strip_age_size_tokens(base_name)
+        if stripped_age and stripped_age.lower() != base_name.lower():
+            heuristic_names.append(stripped_age)
+
+        stripped_generic = strip_generic_query_tokens(stripped_age or base_name)
+        if stripped_generic and stripped_generic.lower() not in {q.lower() for q in heuristic_names}:
+            heuristic_names.append(stripped_generic)
+
+        for q in list(heuristic_names):
+            for group in QUERY_TERM_GROUPS:
+                heuristic_names.extend(expand_term_group(q, group))
+
+        for query in heuristic_names:
+            query_clean = clean_query_text(query)
+            if not query_clean:
+                continue
+            variants.append((query_clean, "name_expanded"))
+            if payload.brand:
+                variants.append((f'"{payload.brand}" {query_clean}', "name_brand_expanded"))
+
+    if base_type in {"gtin_exact", "sku_brand", "sku"} and payload.product_name:
+        if payload.brand:
+            variants.append((f'"{payload.brand}" {payload.product_name}', "name_brand_fuzzy_fallback"))
+        variants.append((payload.product_name, "name_fuzzy_fallback"))
+
+    unique: List[tuple[str, str]] = []
+    seen: set[str] = set()
+    for query, qtype in variants:
+        normalized = clean_query_text(query)
+        if not normalized:
+            continue
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append((normalized, qtype))
+        if len(unique) >= MAX_QUERY_VARIANTS:
+            break
+    return unique
 
 
 def call_serpapi(query: str, country: str, currency: str) -> List[Dict[str, Any]]:
@@ -692,13 +1081,175 @@ def normalized_tokens(text: Optional[str]) -> set[str]:
     return {t for t in tokens if t not in TOKEN_STOPWORDS}
 
 
-def has_brand_match(brand: Optional[str], title: str, source: str) -> bool:
-    brand_tokens = normalized_tokens(brand)
+def meaningful_match_tokens(text: Optional[str]) -> set[str]:
+    tokens = normalized_tokens(text)
+    return {
+        t
+        for t in tokens
+        if t not in GENERIC_APPAREL_QUERY_TOKENS and not any(ch.isdigit() for ch in t)
+    }
+
+
+def contains_keyword(text: str, keyword: str) -> bool:
+    text_l = text.lower()
+    kw = keyword.lower()
+    if " " in kw or "-" in kw:
+        return kw in text_l
+    return re.search(rf"\b{re.escape(kw)}\b", text_l) is not None
+
+
+def extract_type_groups(text: Optional[str]) -> set[str]:
+    if not text:
+        return set()
+    text_l = text.lower()
+    groups: set[str] = set()
+    for group, keywords in PRODUCT_TYPE_GROUPS.items():
+        if any(contains_keyword(text_l, kw) for kw in keywords):
+            groups.add(group)
+    if "boot_general" in groups and ("winter_boot" in groups or "rain_boot" in groups):
+        groups.discard("boot_general")
+    return groups
+
+
+def extract_feature_groups(text: Optional[str]) -> set[str]:
+    if not text:
+        return set()
+    text_l = text.lower()
+    groups: set[str] = set()
+    for group, keywords in PRODUCT_FEATURE_GROUPS.items():
+        if any(contains_keyword(text_l, kw) for kw in keywords):
+            groups.add(group)
+    return groups
+
+
+def extract_color_groups(text: Optional[str]) -> set[str]:
+    if not text:
+        return set()
+    text_l = text.lower()
+    groups: set[str] = set()
+    for group, keywords in COLOR_GROUPS.items():
+        if any(contains_keyword(text_l, kw) for kw in keywords):
+            groups.add(group)
+    return groups
+
+
+def extract_age_years(text: Optional[str]) -> set[int]:
+    if not text:
+        return set()
+    years: set[int] = set()
+    for match in re.finditer(r"\b(\d{1,2})\s*(?:år|aar|yrs?|year|years)\b", text.lower()):
+        try:
+            years.add(int(match.group(1)))
+        except Exception:
+            continue
+    return years
+
+
+def extract_size_markers(text: Optional[str]) -> set[str]:
+    if not text:
+        return set()
+    markers: set[str] = set()
+    for m in re.finditer(r"\b(\d{2,3})\s*/\s*(\d{2,3})\b", text):
+        a, b = m.group(1), m.group(2)
+        markers.add(f"{a}/{b}")
+        markers.add(a)
+        markers.add(b)
+    for m in re.finditer(r"\b(?:str|size)\s*[:.]?\s*(\d{2,3})\b", text.lower()):
+        markers.add(m.group(1))
+    for m in re.finditer(r"\b(\d{2,3})\s*-\s*(\d{2,3})\b", text):
+        a, b = int(m.group(1)), int(m.group(2))
+        if 0 < abs(a - b) <= 25:
+            markers.add(str(a))
+            markers.add(str(b))
+            markers.add(f"{a}-{b}")
+    return markers
+
+
+def has_broad_size_range(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    for m in re.finditer(r"\b(\d{2,3})\s*-\s*(\d{2,3})\b", text):
+        start, end = int(m.group(1)), int(m.group(2))
+        if abs(end - start) >= 8:
+            return True
+    return False
+
+
+def has_age_size_compatibility(query_text: Optional[str], title_text: str) -> bool:
+    query_ages = extract_age_years(query_text)
+    title_ages = extract_age_years(title_text)
+    if query_ages and title_ages and not (query_ages & title_ages):
+        return False
+
+    query_sizes = extract_size_markers(query_text)
+    title_sizes = extract_size_markers(title_text)
+    if query_sizes and title_sizes and not (query_sizes & title_sizes):
+        return False
+
+    return True
+
+
+def has_product_type_conflict(query_text: Optional[str], title_text: str) -> bool:
+    query_groups = extract_type_groups(query_text)
+    title_groups = extract_type_groups(title_text)
+    if not query_groups or not title_groups:
+        return False
+    if query_groups & title_groups:
+        return False
+
+    # Special-case: general boots can match specific boot subtypes.
+    if "boot_general" in query_groups and {"winter_boot", "rain_boot"} & title_groups:
+        return False
+    if "boot_general" in title_groups and {"winter_boot", "rain_boot"} & query_groups:
+        return False
+
+    return True
+
+
+def has_required_feature_match(query_text: Optional[str], title_text: str) -> bool:
+    query_features = extract_feature_groups(query_text)
+    if not query_features:
+        return True
+    title_features = extract_feature_groups(title_text)
+    if not title_features:
+        return True
+
+    if "waterproof" in query_features and "waterproof" not in title_features:
+        return False
+    if "winter" in query_features and "rain" in title_features and "winter" not in title_features:
+        return False
+    return True
+
+
+def has_color_conflict(query_text: Optional[str], title_text: str, link_text: str = "") -> bool:
+    query_colors = extract_color_groups(query_text)
+    if not query_colors:
+        return False
+
+    title_colors = extract_color_groups(f"{title_text} {link_text}")
+    if not title_colors:
+        # Unknown color in result title/link -> do not hard reject.
+        return False
+
+    return not bool(query_colors & title_colors)
+
+
+def get_brand_tokens(brand: Optional[str]) -> set[str]:
+    if not brand:
+        return set()
+    return {t for t in re.findall(r"[a-z0-9]+", brand.lower()) if len(t) >= 2}
+
+
+def has_brand_match(brand: Optional[str], title: str, source: str, link: str = "") -> bool:
+    brand_tokens = get_brand_tokens(brand)
     if not brand_tokens:
         return True
-    result_tokens = normalized_tokens(f"{title} {source}")
+    haystack = f"{title} {source} {link}".lower()
+    if brand and brand.strip().lower() in haystack:
+        return True
+    result_tokens = {t for t in re.findall(r"[a-z0-9]+", haystack) if len(t) >= 2}
     matched = len(brand_tokens & result_tokens)
-    required = max(1, math.ceil(len(brand_tokens) * 0.6))
+    required = max(1, math.ceil(len(brand_tokens) * 0.7))
     return matched >= required
 
 
@@ -706,7 +1257,7 @@ def has_signature_model_match(payload: AnalyzeRequest, title: str) -> bool:
     if not payload.product_name:
         return True
 
-    product_tokens = normalized_tokens(payload.product_name)
+    product_tokens = meaningful_match_tokens(payload.product_name)
     if not product_tokens:
         return True
 
@@ -715,20 +1266,99 @@ def has_signature_model_match(payload: AnalyzeRequest, title: str) -> bool:
     if not signature_tokens:
         return True
 
-    title_tokens = normalized_tokens(title)
-    return bool(signature_tokens & title_tokens)
+    title_tokens = meaningful_match_tokens(title)
+    if signature_tokens & title_tokens:
+        return True
+
+    title_l = title.lower()
+    for token in signature_tokens:
+        if len(token) >= 5 and token in title_l:
+            return True
+    return False
 
 
 def is_wrong_model(payload: AnalyzeRequest, title: str) -> bool:
     if not payload.product_name:
         return False
-    name_tokens = normalized_tokens(payload.product_name)
-    title_tokens = normalized_tokens(title)
+    name_tokens = meaningful_match_tokens(payload.product_name)
+    title_tokens = meaningful_match_tokens(title)
     if not name_tokens:
         return False
     overlap = len(name_tokens & title_tokens) / max(len(name_tokens), 1)
-    # Strict threshold for fuzzy mode to avoid accessories.
-    return overlap < 0.45
+    # Be less strict when user already narrowed search by brand/store filter.
+    threshold = 0.45
+    if payload.brand or payload.store_filters:
+        threshold = 0.30
+    # Broad fuzzy queries with few words should not be over-penalized.
+    if not (payload.gtin13 or payload.gtin8 or payload.sku) and len(name_tokens) <= 3:
+        threshold = min(threshold, 0.30)
+    return overlap < threshold
+
+
+def minimum_match_score(payload: AnalyzeRequest) -> float:
+    if payload.gtin13 or payload.gtin8 or payload.sku:
+        return MIN_MATCH_SCORE_STRONG_ID
+    if payload.brand:
+        return MIN_MATCH_SCORE_BRAND
+    return MIN_MATCH_SCORE_DEFAULT
+
+
+def compute_match_score(payload: AnalyzeRequest, title: str, source: str, link: str) -> float:
+    score = 0.0
+
+    if payload.brand:
+        if has_brand_match(payload.brand, title=title, source=source, link=link):
+            score += 0.30
+    else:
+        score += 0.08
+
+    query_groups = extract_type_groups(payload.product_name)
+    title_groups = extract_type_groups(title)
+    if query_groups:
+        if query_groups & title_groups:
+            score += 0.24
+        elif "boot_general" in query_groups and {"winter_boot", "rain_boot"} & title_groups:
+            score += 0.18
+        elif not title_groups:
+            score += 0.08
+    else:
+        score += 0.08
+
+    query_features = extract_feature_groups(payload.product_name)
+    title_features = extract_feature_groups(title)
+    if query_features:
+        ratio = len(query_features & title_features) / len(query_features)
+        score += 0.16 * ratio
+    else:
+        score += 0.05
+
+    query_colors = extract_color_groups(payload.product_name)
+    title_colors = extract_color_groups(f"{title} {link}")
+    if query_colors:
+        if title_colors and (query_colors & title_colors):
+            score += 0.14
+        elif not title_colors:
+            score += 0.02
+    else:
+        score += 0.04
+
+    query_tokens = meaningful_match_tokens(payload.product_name)
+    title_tokens = meaningful_match_tokens(title)
+    if query_tokens:
+        overlap_ratio = len(query_tokens & title_tokens) / len(query_tokens)
+        score += 0.17 * overlap_ratio
+    else:
+        score += 0.08
+
+    query_has_age_size = bool(extract_age_years(payload.product_name) or extract_size_markers(payload.product_name))
+    title_has_age_size = bool(extract_age_years(title) or extract_size_markers(title))
+    if query_has_age_size:
+        if has_age_size_compatibility(payload.product_name, title):
+            score += 0.13 if title_has_age_size else 0.06
+    else:
+        score += 0.05
+
+    return round(min(score, 1.0), 3)
 
 
 def contains_accessory_signal(product_name: Optional[str], title: str) -> bool:
@@ -742,17 +1372,37 @@ def contains_accessory_signal(product_name: Optional[str], title: str) -> bool:
     return False
 
 
-def is_allowed_source_for_denmark(source: str, shipping: str) -> bool:
+def is_allowed_source_for_denmark(source: str, shipping: str, link: str = "") -> bool:
     source_l = source.lower().strip()
     shipping_l = shipping.lower().strip()
+    link_l = link.lower().strip()
 
-    if any(blocked in source_l for blocked in BLOCKED_SOURCES):
+    if any(blocked in source_l or blocked in link_l for blocked in BLOCKED_SOURCES):
         return False
-    if any(allowed in source_l for allowed in ALLOWED_CROSS_BORDER_SOURCES):
+    if any(allowed in source_l or allowed in link_l for allowed in ALLOWED_CROSS_BORDER_SOURCES):
         return True
 
     # Native DK domains/sources are always allowed.
-    if ".dk" in source_l or "/dk" in source_l or source_l.endswith(" dk"):
+    if (
+        ".dk" in source_l
+        or source_l.endswith(" dk")
+        or ".dk/" in link_l
+        or link_l.startswith("https://dk.")
+        or link_l.startswith("http://dk.")
+    ):
+        return True
+
+    # Locale-specific pages on non-.dk domains can still be Denmark storefronts.
+    locale_markers = [
+        "/da-dk/",
+        "/da_dk/",
+        "locale=da-dk",
+        "locale=da_dk",
+        "lang=da",
+        "country=dk",
+        "market=dk",
+    ]
+    if any(marker in link_l for marker in locale_markers):
         return True
 
     # Danish shops can exist on .com domains; allow if shipping clearly includes Denmark.
@@ -775,6 +1425,42 @@ def is_allowed_source_for_denmark(source: str, shipping: str) -> bool:
 def is_preferred_child_store(source: str) -> bool:
     source_l = source.lower().strip()
     return any(marker in source_l for marker in PREFERRED_CHILD_STORES)
+
+
+def matches_store_filters(source: str, link: str, store_filters: Optional[List[str]]) -> bool:
+    if not store_filters:
+        return True
+    haystack = f"{source} {link}".lower()
+    return any(marker in haystack for marker in store_filters)
+
+
+def extract_image_url(raw_result: Dict[str, Any]) -> Optional[str]:
+    direct_candidates: List[Any] = [
+        raw_result.get("thumbnail"),
+        raw_result.get("image"),
+        raw_result.get("image_url"),
+    ]
+    for candidate in direct_candidates:
+        if isinstance(candidate, str) and candidate.strip().startswith(("http://", "https://")):
+            return candidate.strip()
+
+    list_candidates: List[Any] = [
+        raw_result.get("thumbnails"),
+        raw_result.get("serpapi_thumbnails"),
+    ]
+    for candidate_list in list_candidates:
+        if not isinstance(candidate_list, list):
+            continue
+        for item in candidate_list:
+            if isinstance(item, str) and item.strip().startswith(("http://", "https://")):
+                return item.strip()
+            if isinstance(item, dict):
+                for key in ("thumbnail", "image", "url", "link"):
+                    value = item.get(key)
+                    if isinstance(value, str) and value.strip().startswith(("http://", "https://")):
+                        return value.strip()
+
+    return None
 
 
 def parse_and_filter_results(payload: AnalyzeRequest, raw_results: List[Dict[str, Any]]) -> tuple[List[Alternative], int]:
@@ -801,9 +1487,13 @@ def parse_and_filter_results(payload: AnalyzeRequest, raw_results: List[Dict[str
         total_price = round(price + shipping_price, 2)
 
         if payload.country.lower() == "dk":
-            if not is_allowed_source_for_denmark(source, shipping):
+            if not is_allowed_source_for_denmark(source, shipping, link):
                 excluded += 1
                 continue
+
+        if not matches_store_filters(source=source, link=link, store_filters=payload.store_filters):
+            excluded += 1
+            continue
 
         if ("used" in condition or "used" in title.lower()) and not payload.include_used:
             excluded += 1
@@ -813,7 +1503,27 @@ def parse_and_filter_results(payload: AnalyzeRequest, raw_results: List[Dict[str
             excluded += 1
             continue
 
-        if payload.brand and not has_brand_match(payload.brand, title=title, source=source):
+        if payload.brand and not has_brand_match(payload.brand, title=title, source=source, link=link):
+            excluded += 1
+            continue
+
+        if has_product_type_conflict(payload.product_name, title):
+            excluded += 1
+            continue
+
+        if not has_required_feature_match(payload.product_name, title):
+            excluded += 1
+            continue
+
+        if has_color_conflict(payload.product_name, title, link):
+            excluded += 1
+            continue
+
+        if not has_age_size_compatibility(payload.product_name, title):
+            excluded += 1
+            continue
+
+        if extract_age_years(payload.product_name) and has_broad_size_range(title) and not extract_age_years(title):
             excluded += 1
             continue
 
@@ -836,6 +1546,11 @@ def parse_and_filter_results(payload: AnalyzeRequest, raw_results: List[Dict[str
             excluded += 1
             continue
 
+        match_score = compute_match_score(payload, title=title, source=source, link=link)
+        if match_score < minimum_match_score(payload):
+            excluded += 1
+            continue
+	
         filtered.append(
             Alternative(
                 shop=source,
@@ -845,6 +1560,8 @@ def parse_and_filter_results(payload: AnalyzeRequest, raw_results: List[Dict[str
                 title=title or None,
                 item_price=round(price, 2),
                 shipping_price=round(shipping_price, 2),
+                image_url=extract_image_url(r),
+                match_score=match_score,
             )
         )
 
@@ -852,7 +1569,7 @@ def parse_and_filter_results(payload: AnalyzeRequest, raw_results: List[Dict[str
     if preferred:
         filtered = preferred
 
-    filtered.sort(key=lambda x: x.price)
+    filtered.sort(key=lambda x: (-(x.match_score or 0.0), x.price))
     return filtered, excluded
 
 
@@ -902,37 +1619,64 @@ def normalize_payload_for_denmark(payload: AnalyzeRequest) -> AnalyzeRequest:
     return payload.model_copy(update={"country": DEFAULT_COUNTRY, "currency": DEFAULT_CURRENCY})
 
 
+def alternative_dedupe_key(alt: Alternative) -> str:
+    if alt.url:
+        return alt.url.strip().lower()
+    return f"{alt.shop.lower().strip()}::{(alt.title or '').lower().strip()}"
+
+
+def dedupe_alternatives(alternatives: List[Alternative]) -> List[Alternative]:
+    deduped: Dict[str, Alternative] = {}
+    for alt in alternatives:
+        key = alternative_dedupe_key(alt)
+        existing = deduped.get(key)
+        if existing is None or alt.price < existing.price:
+            deduped[key] = alt
+    return sorted(deduped.values(), key=lambda x: x.price)
+
+
 def resolve_alternatives(payload: AnalyzeRequest, currency: str) -> tuple[List[Alternative], int, str]:
-    query, query_type = build_search_query(payload)
-    search_variants: List[tuple[str, str]] = [(query, query_type)]
-    if query_type in {"gtin_exact", "sku_brand", "sku"} and payload.product_name:
-        if payload.brand:
-            search_variants.append((f'"{payload.brand}" {payload.product_name}', "name_brand_fuzzy_fallback"))
-        search_variants.append((payload.product_name, "name_fuzzy_fallback"))
+    search_variants = build_search_variants(payload)
+    if not search_variants:
+        raise HTTPException(status_code=400, detail="No valid search variants available")
 
-    alternatives: List[Alternative] = []
-    excluded = 0
-    selected_query_type = query_type
+    all_alternatives: List[Alternative] = []
+    excluded_total = 0
+    selected_query_type = search_variants[0][1]
+    processed_queries: set[str] = set()
 
-    # Try primary search first; fallback from SKU/GTIN to name-based search when matches collapse to zero.
-    for search_query, variant_type in search_variants:
-        key = cache_key(payload, search_query)
-        raw_results = get_cached(key)
-        if raw_results is None:
-            raw_results = call_serpapi(query=search_query, country=payload.country, currency=currency)
-            set_cached(key, raw_results)
+    def run_variants(variants: List[tuple[str, str]]) -> None:
+        nonlocal excluded_total, selected_query_type, all_alternatives
+        for search_query, variant_type in variants:
+            normalized_query = clean_query_text(search_query)
+            query_key = normalized_query.lower()
+            if not normalized_query or query_key in processed_queries:
+                continue
+            processed_queries.add(query_key)
 
-        current_alts, current_excluded = parse_and_filter_results(payload, raw_results)
-        if current_alts:
-            alternatives = current_alts
-            excluded = current_excluded
-            selected_query_type = variant_type
-            break
+            key = cache_key(payload, normalized_query)
+            raw_results = get_cached(key)
+            if raw_results is None:
+                raw_results = call_serpapi(query=normalized_query, country=payload.country, currency=currency)
+                set_cached(key, raw_results)
 
-        # Preserve the latest excluded count for diagnostics if all variants fail.
-        excluded = current_excluded
+            current_alts, current_excluded = parse_and_filter_results(payload, raw_results)
+            excluded_total += current_excluded
+            if current_alts:
+                if not all_alternatives:
+                    selected_query_type = variant_type
+                all_alternatives.extend(current_alts)
+                if len(dedupe_alternatives(all_alternatives)) >= EARLY_STOP_MIN_UNIQUE_MATCHES:
+                    break
 
-    return alternatives, excluded, selected_query_type
+    run_variants(search_variants)
+
+    if len(dedupe_alternatives(all_alternatives)) < LLM_QUERY_TRIGGER_MIN_MATCHES and not payload.query_variants:
+        auto_variants = get_auto_query_variants(payload)
+        if auto_variants:
+            run_variants(build_search_variants(payload, extra_variants=auto_variants))
+
+    return dedupe_alternatives(all_alternatives), excluded_total, selected_query_type
 
 
 def analyze_impl(payload: AnalyzeRequest) -> AnalyzeResponse:
@@ -943,7 +1687,7 @@ def analyze_impl(payload: AnalyzeRequest) -> AnalyzeResponse:
     try:
         alternatives, excluded, selected_query_type = resolve_alternatives(payload, currency)
 
-        market_min_price = alternatives[0].price if alternatives else None
+        market_min_price = min((a.price for a in alternatives), default=None)
         market_avg_price = mean([a.price for a in alternatives]) if alternatives else None
 
         verdict = decide_verdict(payload.current_price, market_min_price, market_avg_price)

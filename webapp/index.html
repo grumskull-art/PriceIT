@@ -80,7 +80,7 @@
       font-weight: 600;
     }
 
-    input {
+    input, select, textarea {
       width: 100%;
       border-radius: 12px;
       border: 1px solid #c6ccd6;
@@ -90,7 +90,7 @@
       background: #fff;
     }
 
-    input:focus {
+    input:focus, select:focus, textarea:focus {
       outline: 2px solid #91d4c6;
       border-color: #8bbcae;
     }
@@ -190,6 +190,32 @@
       margin-top: 8px;
     }
 
+    .alt-row {
+      display: grid;
+      grid-template-columns: 76px 1fr;
+      gap: 10px;
+      align-items: start;
+    }
+
+    .alt-thumb {
+      width: 76px;
+      height: 76px;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      background: #f4f6fa;
+      object-fit: cover;
+      display: block;
+    }
+
+    .alt-thumb-empty {
+      display: grid;
+      place-items: center;
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .3px;
+    }
+
     .alt a {
       color: #205f95;
       text-decoration: none;
@@ -208,11 +234,11 @@
     <h1 class="title">PriceIT</h1>
     <p class="subtitle">iPhone-webapp til prischeck + søgning. Kildefilter: kun DK + amazon.de. eBay er blokeret.</p>
 
-    <form id="form" class="card">
+    <form id="form" class="card" autocomplete="off">
       <div class="grid">
         <div>
           <label for="productUrl">Produktlink (hurtig autofyld)</label>
-          <input id="productUrl" name="product_url" type="url" placeholder="Indsæt link fra produktsiden">
+          <input id="productUrl" name="product_url_nohistory_20260215" type="url" inputmode="url" autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" placeholder="Indsæt link fra produktsiden">
         </div>
       </div>
 
@@ -225,6 +251,10 @@
         <div>
           <label for="productName">Produktnavn (anbefalet)</label>
           <input id="productName" name="product_name" type="text" placeholder="fx Nike Air Zoom Pegasus 40">
+        </div>
+        <div>
+          <label for="queryPack">GPT query-pack (valgfri, kan stå tom)</label>
+          <textarea id="queryPack" name="query_pack" rows="3" placeholder="Tom = auto query-boost hvis OPENAI_API_KEY er sat&#10;Ellers: én linje pr query"></textarea>
         </div>
       </div>
 
@@ -244,6 +274,16 @@
         <div>
           <label for="sku">SKU (valgfri)</label>
           <input id="sku" name="sku" type="text" placeholder="fx ABC-123">
+        </div>
+        <div>
+          <label for="storeFilter">Butiksfilter (valgfri)</label>
+          <select id="storeFilter" name="store_filter">
+            <option value="">Alle tilladte butikker</option>
+            <option value="zalando">Kun Zalando</option>
+            <option value="next">Kun Next</option>
+            <option value="nameit">Kun Name It</option>
+            <option value="kids">Børnesider (favoritter)</option>
+          </select>
         </div>
       </div>
 
@@ -274,6 +314,8 @@
     const brandInput = document.getElementById("brand");
     const gtin13Input = document.getElementById("gtin13");
     const skuInput = document.getElementById("sku");
+    const storeFilterInput = document.getElementById("storeFilter");
+    const queryPackInput = document.getElementById("queryPack");
 
     const fmt = (value, currency) => {
       if (value === null || value === undefined) return "-";
@@ -294,6 +336,37 @@
       "'": "&#39;"
     }[c]));
 
+    function selectedStoreFilters() {
+      const value = (storeFilterInput.value || "").trim();
+      if (!value) return null;
+      if (value === "zalando") return ["zalando"];
+      if (value === "next") return ["next"];
+      if (value === "nameit") return ["name it", "nameit"];
+      if (value === "kids") {
+        return ["zalando", "next", "name it", "nameit", "jollyroom", "boozt", "kids-world", "kidsworld", "luksusbaby"];
+      }
+      return null;
+    }
+
+    function queryVariantsFromInput() {
+      const text = (queryPackInput.value || "").trim();
+      if (!text) return null;
+      const raw = text
+        .split(/\r?\n|[,;]+/)
+        .map((x) => x.trim())
+        .filter(Boolean);
+      const unique = [];
+      const seen = new Set();
+      for (const q of raw) {
+        const k = q.toLowerCase();
+        if (seen.has(k)) continue;
+        seen.add(k);
+        unique.push(q);
+        if (unique.length >= 10) break;
+      }
+      return unique.length ? unique : null;
+    }
+
     function hideResult() {
       resultEl.style.display = "none";
       resultEl.innerHTML = "";
@@ -306,7 +379,9 @@
         current_price: (data.get("current_price") || "").toString().trim() || null,
         brand: (data.get("brand") || "").toString().trim() || null,
         gtin13: (data.get("gtin13") || "").toString().trim() || null,
-        sku: (data.get("sku") || "").toString().trim() || null
+        sku: (data.get("sku") || "").toString().trim() || null,
+        store_filters: selectedStoreFilters(),
+        query_variants: queryVariantsFromInput()
       };
     }
 
@@ -416,10 +491,19 @@
     function renderAnalyzeResult(data) {
       const alternatives = (data.top_3_alternatives || []).map((alt) => `
         <div class="alt">
-          <div class="hint">Fundet titel: ${esc(alt.title || "-")}</div>
-          <div><strong>${esc(alt.shop)}</strong> - ${fmt(alt.price, alt.currency || data.currency)}</div>
-          <div class="hint">Vare: ${fmt(alt.item_price, alt.currency || data.currency)} | Fragt: ${fmt(alt.shipping_price, alt.currency || data.currency)}</div>
-          <div><a href="${esc(alt.url)}" target="_blank" rel="noopener noreferrer">Open tilbud</a></div>
+          <div class="alt-row">
+            ${alt.image_url
+              ? `<a href="${esc(alt.url)}" target="_blank" rel="noopener noreferrer"><img class="alt-thumb" src="${esc(alt.image_url)}" alt="Produktbillede" loading="lazy" referrerpolicy="no-referrer"></a>`
+              : `<div class="alt-thumb alt-thumb-empty">Intet billede</div>`
+            }
+            <div>
+              <div class="hint">Fundet titel: ${esc(alt.title || "-")}</div>
+              <div><strong>${esc(alt.shop)}</strong> - ${fmt(alt.price, alt.currency || data.currency)}</div>
+              <div class="hint">Matchscore: ${alt.match_score ? Math.round(alt.match_score * 100) + "%" : "-"}</div>
+              <div class="hint">Vare: ${fmt(alt.item_price, alt.currency || data.currency)} | Fragt: ${fmt(alt.shipping_price, alt.currency || data.currency)}</div>
+              <div><a href="${esc(alt.url)}" target="_blank" rel="noopener noreferrer">Open tilbud</a></div>
+            </div>
+          </div>
         </div>
       `).join("");
 
@@ -442,10 +526,19 @@
     function renderSearchResult(data) {
       const offers = (data.offers || []).map((alt, index) => `
         <div class="alt">
-          <div><strong>${index + 1}. ${esc(alt.shop)}</strong> - ${fmt(alt.price, alt.currency || data.currency)}</div>
-          <div class="hint">Vare: ${fmt(alt.item_price, alt.currency || data.currency)} | Fragt: ${fmt(alt.shipping_price, alt.currency || data.currency)}</div>
-          <div class="hint">Fundet titel: ${esc(alt.title || "-")}</div>
-          <div><a href="${esc(alt.url)}" target="_blank" rel="noopener noreferrer">Open tilbud</a></div>
+          <div class="alt-row">
+            ${alt.image_url
+              ? `<a href="${esc(alt.url)}" target="_blank" rel="noopener noreferrer"><img class="alt-thumb" src="${esc(alt.image_url)}" alt="Produktbillede" loading="lazy" referrerpolicy="no-referrer"></a>`
+              : `<div class="alt-thumb alt-thumb-empty">Intet billede</div>`
+            }
+            <div>
+              <div><strong>${index + 1}. ${esc(alt.shop)}</strong> - ${fmt(alt.price, alt.currency || data.currency)}</div>
+              <div class="hint">Matchscore: ${alt.match_score ? Math.round(alt.match_score * 100) + "%" : "-"}</div>
+              <div class="hint">Vare: ${fmt(alt.item_price, alt.currency || data.currency)} | Fragt: ${fmt(alt.shipping_price, alt.currency || data.currency)}</div>
+              <div class="hint">Fundet titel: ${esc(alt.title || "-")}</div>
+              <div><a href="${esc(alt.url)}" target="_blank" rel="noopener noreferrer">Open tilbud</a></div>
+            </div>
+          </div>
         </div>
       `).join("");
 
